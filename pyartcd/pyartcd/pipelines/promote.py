@@ -570,18 +570,17 @@ class PromotePipeline:
 
     async def _publish_json_digest_signatures(self, local_dir: Union[str, Path], env: str = "prod"):
         tasks = []
+        destinations = ["openshift/release", "openshift-release-dev/ocp-release", "openshift-release-dev/ocp-release-nightly"]
+
         # mirror to S3
-        mirror_release_path = "release" if env == "prod" else "test"
-        tasks.append(util.mirror_to_s3(local_dir, f"s3://art-srv-enterprise/pub/openshift-v4/signatures/openshift/{mirror_release_path}/", exclude="*", include="sha256=*", dry_run=self.runtime.dry_run))
-        if mirror_release_path == "release":
-            tasks.append(util.mirror_to_s3(local_dir, "s3://art-srv-enterprise/pub/openshift-v4/signatures/openshift-release-dev/ocp-release/", exclude="*", include="sha256=*", dry_run=self.runtime.dry_run))
-            tasks.append(util.mirror_to_s3(local_dir, "s3://art-srv-enterprise/pub/openshift-v4/signatures/openshift-release-dev/ocp-release-nightly/", exclude="*", include="sha256=*", dry_run=self.runtime.dry_run))
+        s3_release_path = "signatures" if env == "prod" else "signatures/test":
+        for dest in destinations:
+            tasks.append(util.mirror_to_s3(local_dir, f"s3://art-srv-enterprise/pub/openshift-v4/{s3_release_path}/{dest}/", exclude="*", include="sha256=*", dry_run=self.runtime.dry_run))
 
         # mirror to google storage
         google_storage_path = "official" if env == "prod" else "test-1"
-        tasks.append(util.mirror_to_google_cloud(f"{local_dir}/*", f"gs://openshift-release/{google_storage_path}/signatures/openshift/release", dry_run=self.runtime.dry_run))
-        tasks.append(util.mirror_to_google_cloud(f"{local_dir}/*", f"gs://openshift-release/{google_storage_path}/signatures/openshift-release-dev/ocp-release", dry_run=self.runtime.dry_run))
-        tasks.append(util.mirror_to_google_cloud(f"{local_dir}/*", f"gs://openshift-release/{google_storage_path}/signatures/openshift-release-dev/ocp-release-nightly", dry_run=self.runtime.dry_run))
+        for dest in destinations:
+            tasks.append(util.mirror_to_google_cloud(f"{local_dir}/*", f"gs://openshift-release/{google_storage_path}/signatures/{dest}", dry_run=self.runtime.dry_run))
 
         await asyncio.gather(*tasks)
 
