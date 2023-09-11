@@ -569,18 +569,27 @@ class PromotePipeline:
                 sig_file=sig_file)
 
     async def _publish_json_digest_signatures(self, local_dir: Union[str, Path], env: str = "prod"):
-        tasks = []
-        destinations = ["openshift/release", "openshift-release-dev/ocp-release", "openshift-release-dev/ocp-release-nightly"]
+        # local_dir should contain 1 or more directories that look like "sha256=...."
+        # first copy/move the signatures to intended paths for the destination directory tree
+        real_repo = local_dir / "openshift-release-dev" / "ocp-release"
+        for path in [local_dir / "openshift" / "release", real_repo]:
+            path.mkdir(parents=True)
+            for digest_dir in local_dir.glob("sha256=*"):
+                # just a straight copy of the signature directory
+                shutil.copytree(digest_dir, path / digest_dir.name)
 
+        # move the signature directories to the repo@sha naming expected in a sigstore
+        for digest_dir in local_dir.glob("sha256=*"):
+            digest_dir.rename(real_repo.with_name(f"{real_repo.name}@{digest_dir.name}"))
+
+        tasks = []
         # mirror to S3
-        s3_release_path = "signatures" if env == "prod" else "signatures/test":
-        for dest in destinations:
-            tasks.append(util.mirror_to_s3(local_dir, f"s3://art-srv-enterprise/pub/openshift-v4/{s3_release_path}/{dest}/", exclude="*", include="sha256=*", dry_run=self.runtime.dry_run))
+        s3_release_path = "signatures" if env == "prod" else "signatures/test"
+        tasks.append(util.mirror_to_s3(local_dir, f"s3://art-srv-enterprise/pub/openshift-v4/{s3_release_path}/", dry_run=self.runtime.dry_run))
 
         # mirror to google storage
         google_storage_path = "official" if env == "prod" else "test-1"
-        for dest in destinations:
-            tasks.append(util.mirror_to_google_cloud(f"{local_dir}/*", f"gs://openshift-release/{google_storage_path}/signatures/{dest}", dry_run=self.runtime.dry_run))
+        tasks.append(util.mirror_to_google_cloud(f"{local_dir}/*", f"gs://openshift-release/{google_storage_path}/signatures/", dry_run=self.runtime.dry_run))
 
         await asyncio.gather(*tasks)
 
