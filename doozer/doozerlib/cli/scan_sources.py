@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import click
 import yaml
 
-from artcommonlib.rhcos import get_primary_container_name
+from artcommon.rhcos import get_primary_container_name
 from doozerlib import brew, exectools, rhcos, util
 from doozerlib.cli import cli, pass_runtime
 from doozerlib.cli import release_gen_payload as rgp
