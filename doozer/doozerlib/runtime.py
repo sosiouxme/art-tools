@@ -22,6 +22,7 @@ import re
 
 from jira import JIRA
 
+from artcommon.runtime import GroupRuntime
 from doozerlib import gitdata
 from . import logutil
 from . import assertion
@@ -80,7 +81,7 @@ SourceResolution = namedtuple('SourceResolution', [
 ])
 
 
-class Runtime(object):
+class Runtime(GroupRuntime):
     # Use any time it is necessary to synchronize feedback from multiple threads.
     mutex = RLock()
 
@@ -135,7 +136,7 @@ class Runtime(object):
             self.ignore_missing_base = True
 
         self._remove_tmp_working_dir = False
-        self.group_config = None
+        self._group_config = None
 
         self.cwd = os.getcwd()
 
@@ -246,6 +247,14 @@ class Runtime(object):
             self.releases_config = Model()
 
         return self.releases_config
+
+    @property
+    def group_config(self):
+        return self._group_config
+
+    @group_config.setter
+    def group_config(self, config: Model):
+        self._group_config = config
 
     def get_group_config(self) -> Model:
         # group.yml can contain a `vars` section which should be a
