@@ -211,9 +211,10 @@ class PrepareReleasePipeline:
         _LOGGER.info("Sweep bugs into the the advisories...")
         self.sweep_bugs()
 
-        _LOGGER.info("Processing attached Security Trackers")
-        for _, advisory in advisories.items():
-            self.attach_cve_flaws(advisory)
+        # ## skip flaw processing during pre-releases
+        # _LOGGER.info("Processing attached Security Trackers")
+        # for _, advisory in advisories.items():
+        #     self.attach_cve_flaws(advisory)
 
         # Verify the swept builds match the nightlies
         if self.release_version[0] < 4:
