@@ -278,9 +278,10 @@ def categorize_bugs_by_type(bugs: List[Bug], advisory_id_map: Dict[str, int],
         if b.is_tracker_bug():
             tracker_bugs.add(b)
         else:
-            non_tracker_bugs.add(b)
             if b.is_invalid_tracker_bug():
                 fake_trackers.add(b)
+            else:
+                non_tracker_bugs.add(b)
 
     bugs_by_type["extras"] = extras_bugs(non_tracker_bugs)
     remaining = non_tracker_bugs - bugs_by_type["extras"]
@@ -289,7 +290,7 @@ def categorize_bugs_by_type(bugs: List[Bug], advisory_id_map: Dict[str, int],
     bugs_by_type["image"] = remaining
 
     if fake_trackers:
-        raise ElliottFatalError(f"Bug(s) {[t.id for t in fake_trackers]} look like CVE trackers, but really are not. Please fix.")
+        logger.error(f"Bug(s) {[t.id for t in fake_trackers]} look like CVE trackers, but really are not. Please fix.")
 
     if not tracker_bugs:
         return bugs_by_type
