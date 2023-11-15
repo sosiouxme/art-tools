@@ -352,8 +352,7 @@ def categorize_bugs_by_type(bugs: List[Bug], advisory_id_map: Dict[str, int],
             message = ('No attached builds found in advisories for tracker bugs (bug, package): '
                        f'{not_permitted_with_component}. Either attach builds or explicitly include/exclude the bug '
                        f'ids in the assembly definition')
-            logger.error(message)
-            raise ValueError(message)
+            logger.warning(message)
 
     return bugs_by_type
 
