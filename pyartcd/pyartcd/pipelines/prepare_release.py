@@ -434,7 +434,7 @@ class PrepareReleasePipeline:
         only_payload = False
         only_non_payload = False
         if impetus in ["rpm", "microshift"]:
-            kind = "rpm"
+            return  # for now, do not fill these
         elif impetus in ["image", "extras"]:
             kind = "image"
             if impetus == "image" and self.release_version[0] >= 4:
