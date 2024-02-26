@@ -895,7 +895,7 @@ def images_streams_prs(runtime, github_access_token, bug, interstitial, ignore_c
             gomods = [Path(repo_dir, 'go.mod')]
         for gomod in gomods:
             if gomod.is_file():
-                exectools.cmd_assert(f"sed -i -e 's/^go 1.*/go {go_minor}/; "
+                exectools.cmd_assert(f"sed -i -e 's/^go 1.*/go {go_minor}.0/; "
                                      f"s/^toolchain go.*/toolchain go{go_full}/' {gomod}")
                 exectools.cmd_assert(f"git add --force {gomod}")
 
