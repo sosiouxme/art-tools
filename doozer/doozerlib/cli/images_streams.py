@@ -889,12 +889,15 @@ def images_streams_prs(runtime, github_access_token, bug, interstitial, ignore_c
             return
         go_full = version[1:]  # e.g. "1.20.12"
         go_minor = go_full.rsplit(".", 1)[0]  # e.g. "1.20"
+        logger.warning(f"version: {version} go_full: {go_full} go_minor: {go_minor}")
 
         gomods = [Path(repo_dir, f'{p}/go.mod') for p in image_config.cachito.packages.gomod]
         if not gomods:
             gomods = [Path(repo_dir, 'go.mod')]
         for gomod in gomods:
             if gomod.is_file():
+                logger.warning(f"sed -i -e 's/^go 1.*/go {go_minor}.0/; "
+                               f"s/^toolchain go.*/toolchain go{go_full}/' {gomod}")
                 exectools.cmd_assert(f"sed -i -e 's/^go 1.*/go {go_minor}.0/; "
                                      f"s/^toolchain go.*/toolchain go{go_full}/' {gomod}")
                 exectools.cmd_assert(f"git add --force {gomod}")
