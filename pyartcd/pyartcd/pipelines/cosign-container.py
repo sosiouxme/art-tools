@@ -65,35 +65,41 @@ class CosignPipeline:
         self.assembly = assembly
         self.sign_multi = multi != "no"
         self.sign_arches = multi != "only"
-        self.signing_env = signing_env
+        self.signing_key = signing_key
 
         self._logger = self.runtime.logger
 
         self._working_dir = self.runtime.working_dir
+        self._doozer_working_dir = self._working_dir / "doozer-working"
+        self._doozer_env_vars = os.environ.copy()
+        self._doozer_env_vars["DOOZER_WORKING_DIR"] = str(self._doozer_working_dir)
 
     def check_environment_variables(self):
         logger = self.runtime.logger
 
-        required_vars = ["QUAY_PASSWORD"]
-        if not self.skip_mirror_binaries and not self.skip_signing:
-            required_vars += ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
-        if not self.skip_signing:
-            required_vars += ["SIGNING_CERT", "SIGNING_KEY", "REDIS_SERVER_PASSWORD", "REDIS_HOST", "REDIS_PORT"]
-        if not self.skip_build_microshift:
-            required_vars += ["JENKINS_SERVICE_ACCOUNT", "JENKINS_SERVICE_ACCOUNT_TOKEN"]
+        required_vars = ["QUAY_USERNAME", "QUAY_PASSWORD"]
+        if self.signing_key == "prod":
+            required_vars += ["KMS_ACCESS_KEY_ID", "KMS_SECRET_ACCESS_KEY"]
+        else:
+            required_vars += ["TEST_KMS_ACCESS_KEY_ID", "TEST_KMS_SECRET_ACCESS_KEY"]
 
         for env_var in required_vars:
-            if not os.environ.get(env_var):
+            if not os.environ.get(env_var):  # not there, or empty
                 msg = f"Environment variable {env_var} is not set."
-                if not self.runtime.dry_run:
-                    raise ValueError(msg)
-                else:
+                if self.runtime.dry_run:
                     logger.warning(msg)
+                else:
+                    raise ValueError(msg)
+
+    async def login_quay(self):
+        f"podman login -u '{os.environ['QUAY_USERNAME']}' -p '{os.environ['QUAY_PASSWORD']}' quay.io"
+        await exectools.cmd_assert_async(cmd, env=os.environ.copy(), stdout=sys.stderr)
+
 
     async def run(self):
         logger = self.runtime.logger
-        # Check if all required environment variables are set
         self.check_environment_variables()
+        await self.login_quay()
 
         # Load group config and releases.yml
         logger.info("Loading build data...")
