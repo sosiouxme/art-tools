@@ -78,10 +78,7 @@ class CosignPipeline:
         logger = self.runtime.logger
 
         required_vars = ["QUAY_USERNAME", "QUAY_PASSWORD"]
-        if self.signing_key == "prod":
-            required_vars += ["KMS_ACCESS_KEY_ID", "KMS_SECRET_ACCESS_KEY"]
-        else:
-            required_vars += ["TEST_KMS_ACCESS_KEY_ID", "TEST_KMS_SECRET_ACCESS_KEY"]
+        required_vars.append("KMS_CRED_FILE" if self.signing_key == "prod" else "TEST_KMS_CRED_FILE")
 
         for env_var in required_vars:
             if not os.environ.get(env_var):  # not there, or empty
@@ -93,17 +90,16 @@ class CosignPipeline:
 
     async def login_quay(self):
         # the login command has only the variable names in it, so the values can be picked up from
-        # the environment rather than on the command line where they would be logged
+        # the environment rather than on the command line where they would be logged.
+        # better would be to have jenkins write a credentials file and do the same with `promote`.
         cmd = f'podman login -u "$QUAY_USERNAME" -p "$QUAY_PASSWORD" quay.io'
-        await exectools.cmd_assert_async('echo "$QUAY_USERNAME"', env=os.environ.copy(), stdout=sys.stderr)
-        await exectools.cmd_assert_async(cmd, env=os.environ.copy(), stdout=sys.stderr)
+        await exectools.cmd_assert_async(['bash', '-c', cmd], env=os.environ.copy(), stdout=sys.stderr)
 
 
     async def run(self):
         logger = self.runtime.logger
         self.check_environment_variables()
-        await self.login_quay()
-        exit(0)
+        # await self.login_quay()
 
         # Load group config and releases.yml
         logger.info("Loading build data...")
@@ -114,7 +110,6 @@ class CosignPipeline:
         )
         if releases_config.get("releases", {}).get(self.assembly) is None:
             raise ValueError(f"To promote this release, assembly {self.assembly} must be explicitly defined in releases.yml.")
-        permits = util.get_assembly_promotion_permits(releases_config, self.assembly)
 
         # Get release name
         assembly_type = util.get_assembly_type(releases_config, self.assembly)
@@ -124,130 +119,15 @@ class CosignPipeline:
             raise ValueError(f"Release name `{release_name}` is not a valid semver.")
         logger.info("Release name: %s", release_name)
 
-        self._slack_client.bind_channel(release_name)
-        await self._slack_client.say_in_thread(f"Promoting release `{release_name}` @release-artists")
-
         justifications = []
         try:
-            self._multi_enabled = group_config.get("multi_arch", {}).get("enabled", False)
-            if self.multi_only and not self._multi_enabled:
+            if self.sign_multi and not group_config.get("multi_arch", {}).get("enabled", False)
                 raise ValueError("Can't promote a multi payload: multi_arch.enabled is not set in group config")
             # Get arches
             arches = group_config.get("arches", [])
             arches = list(set(map(brew_arch_for_go_arch, arches)))
             if not arches:
                 raise ValueError("No arches specified in group config.")
-            # Get previous list
-            upgrades_str: Optional[str] = group_config.get("upgrades")
-            if upgrades_str is None and assembly_type not in [assembly.AssemblyTypes.CUSTOM]:
-                raise ValueError(f"Group config for assembly {self.assembly} is missing the required `upgrades` field. If no upgrade edges are expected, please explicitly set the `upgrades` field to empty string.")
-            previous_list = list(map(lambda s: s.strip(), upgrades_str.split(","))) if upgrades_str else []
-            # Ensure all versions in previous list are valid semvers.
-            if any(map(lambda version: not VersionInfo.is_valid(version), previous_list)):
-                raise ValueError("Previous list (`upgrades` field in group config) has an invalid semver.")
-
-            impetus_advisories = group_config.get("advisories", {})
-
-            # Check for blocker bugs
-            if self.skip_blocker_bug_check or assembly_type in [assembly.AssemblyTypes.CANDIDATE, assembly.AssemblyTypes.CUSTOM, assembly.AssemblyTypes.PREVIEW]:
-                logger.info("Blocker Bug check is skipped.")
-            else:
-                logger.info("Checking for blocker bugs...")
-                # TODO: Needs an option in releases.yml to skip this check
-                try:
-                    await self.check_blocker_bugs()
-                except VerificationError as err:
-                    logger.warn("Blocker bugs found for release: %s", err)
-                    justification = self._reraise_if_not_permitted(err, "BLOCKER_BUGS", permits)
-                    justifications.append(justification)
-                logger.info("No blocker bugs found.")
-
-            if assembly_type == assembly.AssemblyTypes.STANDARD:
-                # Attempt to move all advisories to QE
-                tasks = []
-                for impetus, advisory in impetus_advisories.items():
-                    if not advisory or advisory <= 0:
-                        continue
-                    logger.info("Moving advisory %s to QE...", advisory)
-                    if not self.runtime.dry_run:
-                        tasks.append(self.change_advisory_state(advisory, "QE"))
-                    else:
-                        logger.warning("[DRY RUN] Would have moved advisory %s to QE", advisory)
-                try:
-                    await asyncio.gather(*tasks)
-                except ChildProcessError as err:
-                    logger.warn("Error moving advisory %s to QE: %s", advisory, err)
-
-            # Ensure the image advisory is in QE (or later) state.
-            image_advisory = impetus_advisories.get("image", 0)
-            errata_url = ""
-
-            if assembly_type in [assembly.AssemblyTypes.STANDARD, assembly.AssemblyTypes.CANDIDATE]:
-                if image_advisory <= 0:
-                    err = VerificationError(f"No associated image advisory for {self.assembly} is defined.")
-                    justification = self._reraise_if_not_permitted(err, "NO_ERRATA", permits)
-                    justifications.append(justification)
-                else:
-                    logger.info("Verifying associated image advisory %s...", image_advisory)
-                    image_advisory_info = await self.get_advisory_info(image_advisory)
-                    try:
-                        if assembly_type != assembly.AssemblyTypes.CANDIDATE:
-                            self.verify_advisory_status(image_advisory_info)
-                    except VerificationError as err:
-                        logger.warn("%s", err)
-                        justification = self._reraise_if_not_permitted(err, "INVALID_ERRATA_STATUS", permits)
-                        justifications.append(justification)
-
-                    live_id = self.get_live_id(image_advisory_info)
-                    if not live_id:
-                        raise VerificationError(f"Advisory {image_advisory_info['id']} doesn't have a live ID.")
-                    errata_url = f"https://access.redhat.com/errata/{live_id}"  # don't quote
-
-            # Verify attached bugs
-            if self.skip_attached_bug_check:
-                logger.info("Skip checking attached bugs.")
-            else:
-                logger.info("Verifying attached bugs...")
-                advisories = list(filter(lambda ad: ad > 0, impetus_advisories.values()))
-
-                # FIXME: We used to skip blocking bug check for the latest minor version,
-                # because there were a lot of ON_QA bugs in the upcoming GA version blocking us
-                # from preparing z-stream releases for the latest minor version.
-                # Per https://coreos.slack.com/archives/GDBRP5YJH/p1662036090856369?thread_ts=1662024464.786929&cid=GDBRP5YJH,
-                # we would like to try not skipping it by commenting out the following lines and see what will happen.
-                # major, minor = util.isolate_major_minor_in_group(self.group)
-                # next_minor = f"{major}.{minor + 1}"
-                # logger.info("Checking if %s is GA'd...", next_minor)
-                # graph_data = await CincinnatiAPI().get_graph(channel=f"fast-{next_minor}")
-                # if not graph_data.get("nodes"):
-                #     logger.info("%s is not GA'd. Blocking Bug check will be skipped.", next_minor)
-                #     no_verify_blocking_bugs = True
-                # else:
-                #     logger.info("%s is GA'd. Blocking Bug check will be enforced.", next_minor)
-
-                no_verify_blocking_bugs = False
-                if assembly_type in [assembly.AssemblyTypes.PREVIEW,
-                                     assembly.AssemblyTypes.CANDIDATE] or self.assembly.endswith(".0"):
-                    no_verify_blocking_bugs = True
-
-                verify_flaws = True
-                if "prerelease" in impetus_advisories.keys() or assembly_type == assembly.AssemblyTypes.PREVIEW:
-                    verify_flaws = False
-
-                try:
-                    await self.verify_attached_bugs(advisories,
-                                                    no_verify_blocking_bugs=no_verify_blocking_bugs,
-                                                    verify_flaws=verify_flaws)
-                except ChildProcessError as err:
-                    logger.warn("Error verifying attached bugs: %s", err)
-
-                    if assembly_type in [assembly.AssemblyTypes.PREVIEW, assembly.AssemblyTypes.CANDIDATE]:
-                        await self._slack_client.say_in_thread("Attached bugs have some issues. Permitting since "
-                                                               f"assembly is of type {assembly_type}")
-                        await self._slack_client.say_in_thread(str(err))
-                    else:
-                        justification = self._reraise_if_not_permitted(err, "ATTACHED_BUGS", permits)
-                        justifications.append(justification)
 
             # Promote release images
             metadata = {}
