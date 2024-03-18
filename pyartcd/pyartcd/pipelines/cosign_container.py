@@ -58,7 +58,7 @@ class CosignPipeline:
     def __init__(self, runtime: Runtime, group: str, assembly: str,
                  multi: str,
                  signing_key: str,
-                 pullspecs: Optional[List[str]]):
+                 pullspecs: Optional[List[str]]
                 ) -> None:
         self.runtime = runtime
         self.group = group
@@ -92,7 +92,10 @@ class CosignPipeline:
                     raise ValueError(msg)
 
     async def login_quay(self):
-        f"podman login -u '{os.environ['QUAY_USERNAME']}' -p '{os.environ['QUAY_PASSWORD']}' quay.io"
+        # the login command has only the variable names in it, so the values can be picked up from
+        # the environment rather than on the command line where they would be logged
+        cmd = f'podman login -u "$QUAY_USERNAME" -p "$QUAY_PASSWORD" quay.io'
+        await exectools.cmd_assert_async('echo "$QUAY_USERNAME"', env=os.environ.copy(), stdout=sys.stderr)
         await exectools.cmd_assert_async(cmd, env=os.environ.copy(), stdout=sys.stderr)
 
 
@@ -100,6 +103,7 @@ class CosignPipeline:
         logger = self.runtime.logger
         self.check_environment_variables()
         await self.login_quay()
+        exit(0)
 
         # Load group config and releases.yml
         logger.info("Loading build data...")
@@ -1529,7 +1533,7 @@ class CosignPipeline:
 async def cosign_container(runtime: Runtime, group: str, assembly: str,
                   multi: Optional[str]="yes",
                   signing_key: Optional[str]="prod",
-                  pullspecs: Optional[List[str]]):
+                  pullspecs: Optional[List[str]]=None):
     pipeline = await CosignPipeline.create(
         runtime, group, assembly,
         multi, signing_key, pullspecs
