@@ -1,50 +1,19 @@
 import asyncio
 import json
-import logging
 import os
-import re
 import sys
-import traceback
-import requests
-import aiohttp
 import click
-import tarfile
-import hashlib
-import shutil
-from collections import OrderedDict
-from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Union
-from urllib.parse import quote
-from ruamel.yaml import YAML
 from semver import VersionInfo
-from tenacity import (RetryCallState, RetryError, retry,
-                      retry_if_exception_type, retry_if_result,
-                      stop_after_attempt, wait_fixed)
 
-from artcommonlib.arch_util import brew_suffix_for_arch, brew_arch_for_go_arch, \
-    go_suffix_for_arch, go_arch_for_brew_arch
-from artcommonlib.rhcos import get_primary_container_name
-from doozerlib import assembly
-from pyartcd.locks import Lock
 from pyartcd.signatory import AsyncSignatory
-from pyartcd.util import nightlies_with_pullspecs
-from pyartcd import constants, exectools, locks, util, jenkins
+from pyartcd import constants, exectools, util
 from pyartcd.cli import cli, click_coroutine, pass_runtime
-from artcommonlib.exceptions import VerificationError
-from pyartcd.jira import JIRAClient
-from pyartcd.mail import MailService
-from pyartcd.s3 import sync_dir_to_s3_mirror
-from pyartcd.oc import get_release_image_info, get_release_image_pullspec, extract_release_binary, \
-    extract_release_client_tools, get_release_image_info_from_pullspec, extract_baremetal_installer
+from pyartcd.oc import get_release_image_info, get_image_info
 from pyartcd.runtime import Runtime, GroupRuntime
 
 
-yaml = YAML(typ="safe")
-yaml.default_flow_style = False
-
-
-class CosignPipeline:
-    DEST_RELEASE_IMAGE_REPO = constants.RELEASE_IMAGE_REPO
+class SigstorePipeline:
 
     @classmethod
     async def create(cls, *args, **kwargs):
@@ -56,8 +25,7 @@ class CosignPipeline:
         return self
 
     def __init__(self, runtime: Runtime, group: str, assembly: str,
-                 multi: str,
-                 signing_key: str,
+                 multi: str, signing_key: str,
                  pullspecs: Optional[List[str]]
                 ) -> None:
         self.runtime = runtime
@@ -66,6 +34,14 @@ class CosignPipeline:
         self.sign_multi = multi != "no"
         self.sign_arches = multi != "only"
         self.signing_key = signing_key
+        self.pullspecs = pullspecs
+
+        if signing_key == "prod":
+            self.signing_creds = os.environ.get("KMS_CRED_FILE", "dummy-file")
+            self.signing_key_id = os.environ.get("KMS_KEY_ID", "dummy-key")
+        else:
+            self.signing_creds = os.environ.get("TEST_KMS_CRED_FILE", "dummy-file")
+            self.signing_key_id = os.environ.get("TEST_KMS_KEY_ID", "dummy-key")
 
         self._logger = self.runtime.logger
 
@@ -78,7 +54,10 @@ class CosignPipeline:
         logger = self.runtime.logger
 
         required_vars = ["QUAY_USERNAME", "QUAY_PASSWORD"]
-        required_vars.append("KMS_CRED_FILE" if self.signing_key == "prod" else "TEST_KMS_CRED_FILE")
+        if self.signing_key == "prod":
+            required_vars += ["KMS_CRED_FILE", "KMS_KEY_ID"]
+        else:
+            required_vars += ["TEST_KMS_CRED_FILE", "TEST_KMS_KEY_ID"]
 
         for env_var in required_vars:
             if not os.environ.get(env_var):  # not there, or empty
@@ -90,23 +69,23 @@ class CosignPipeline:
 
     async def login_quay(self):
         # the login command has only the variable names in it, so the values can be picked up from
-        # the environment rather than on the command line where they would be logged.
-        # better would be to have jenkins write a credentials file and do the same with `promote`.
+        # the environment rather than included in the command line where they would be logged.
+        # better would be to have jenkins write a credentials file (and do the same in `promote`).
+        return  # XXX
         cmd = f'podman login -u "$QUAY_USERNAME" -p "$QUAY_PASSWORD" quay.io'
         await exectools.cmd_assert_async(['bash', '-c', cmd], env=os.environ.copy(), stdout=sys.stderr)
-
 
     async def run(self):
         logger = self.runtime.logger
         self.check_environment_variables()
-        # await self.login_quay()
+        await self.login_quay()
 
         # Load group config and releases.yml
-        logger.info("Loading build data...")
+        logger.info("Loading build metadata...")
         group_config = self.group_runtime.group_config
         releases_config = await util.load_releases_config(
             group=self.group,
-            data_path=self._doozer_env_vars.get("DOOZER_DATA_PATH", None) or constants.OCP_BUILD_DATA_URL
+            data_path=self._doozer_env_vars.get("DOOZER_DATA_PATH") or constants.OCP_BUILD_DATA_URL
         )
         if releases_config.get("releases", {}).get(self.assembly) is None:
             raise ValueError(f"To sign this release, assembly {self.assembly} must be explicitly defined in releases.yml.")
@@ -119,295 +98,108 @@ class CosignPipeline:
             raise ValueError(f"Release name `{release_name}` is not a valid semver.")
         logger.info("Release name: %s", release_name)
 
-        justifications = []
-        try:
-            if self.sign_multi and not group_config.get("multi_arch", {}).get("enabled", False)
-                raise ValueError("Can't sign a multi payload: multi_arch.enabled is not set in group config")
-            # Get arches
-            arches = group_config.get("arches", [])
-            arches = list(set(map(brew_arch_for_go_arch, arches)))
-            if not arches:
-                raise ValueError("No arches specified in group config.")
+        if not self.pullspecs:
+            # look up release images we expect to be there since none given
+            arches = releases_config.get("group", {}).get("arches") or group_config.get("arches") or []
+            if self.sign_multi:
+                arches.append("multi")
+            self.pullspecs = list(f"{constants.RELEASE_IMAGE_REPO}:{release_name}-{arch}" for arch in arches)
 
-            # Promote release images
-            metadata = {}
-            release_infos = await self.promote(assembly_type, release_name, arches, previous_list, metadata, reference_releases, tag_stable)
-            pullspecs = {arch: release_info["image"] for arch, release_info in release_infos.items()}
-            pullspecs_repr = ", ".join(f"{arch}: {pullspecs[arch]}" for arch in sorted(pullspecs.keys()))
-
-                    await locks.run_with_lock(
-                        coro=self.sign_artifacts(release_name, client_type, release_infos, message_digests),
-                        lock=lock,
-                        lock_name=lock.value.format(signing_env=self.signing_env),
-                        lock_id=lock_identifier
-                    )
-
-        except Exception as err:
-            self._logger.exception(err)
-            error_message = f"Error promoting release {release_name}: {err}\n {traceback.format_exc()}"
-            message = f"Promoting release {release_name} failed with: {error_message}"
-            await self._slack_client.say_in_thread(message)
-            raise
-
-        # Print release infos to console
-        data = {
-            "group": self.group,
-            "assembly": self.assembly,
-            "type": assembly_type.value,
-            "name": release_name,
-            "content": {},
-            "justifications": justifications,
-        }
-        if image_advisory > 0:
-            data["advisory"] = image_advisory
-        if errata_url:
-            data["live_url"] = errata_url
-        for arch, release_info in release_infos.items():
-            data["content"][arch] = {
-                "pullspec": release_info["image"],
-                "digest": release_info["digest"],
-                "metadata": {k: release_info["metadata"][k] for k in release_info["metadata"].keys() & {'version', 'previous'}},
-            }
-            # if this payload is a manifest list, iterate through each manifest
-            manifests = release_info.get("manifests", [])
-            if manifests:
-                manifests_ent = data["content"][arch]["manifests"] = {}
-                for manifest in manifests:
-                    if manifest["platform"]["os"] != "linux":
-                        logger.warning("Unsupported OS %s in manifest list %s", manifest["platform"]["os"], release_info["image"])
-                        continue
-                    manifest_arch = brew_arch_for_go_arch(manifest["platform"]["architecture"])
-                    manifests_ent[manifest_arch] = {
-                        "digest": manifest["digest"]
-                    }
-
-            from_release = release_info.get("references", {}).get("metadata", {}).get("annotations", {}).get("release.openshift.io/from-release")
-            if from_release:
-                data["content"][arch]["from_release"] = from_release
-            rhcos_version = release_info.get("displayVersions", {}).get("machine-os", {}).get("Version", "")
-            if rhcos_version:
-                data["content"][arch]["rhcos_version"] = rhcos_version
-
-        json.dump(data, sys.stdout)
-
-
-    async def sign_artifacts(self, release_name: str, client_type: str, release_infos: Dict, message_digests: List[str]):
-        """ Signs artifacts and publishes signature files to mirror
-        """
-        if not self.signing_env:
-            raise ValueError("--signing-env is missing")
-        cert_file = os.environ["SIGNING_CERT"]
-        key_file = os.environ["SIGNING_KEY"]
-        uri = constants.UMB_BROKERS[self.signing_env]
-        sig_keyname = "redhatrelease2" if client_type == 'ocp' else "beta2"
-        self._logger.info("About to sign artifacts with key %s", sig_keyname)
-        json_digest_sig_dir = self._working_dir / "json_digests"
-        message_digest_sig_dir = self._working_dir / "message_digests"
-        base_to_mirror_dir = self._working_dir / "to_mirror/openshift-v4"
-
-        async with AsyncSignatory(uri, cert_file, key_file, sig_keyname=sig_keyname) as signatory:
-            tasks = []
-            json_digests = []
-            for release_info in release_infos.values():
-                version = release_info["metadata"]["version"]
-                pullspec = release_info["image"]
-                digest = release_info["digest"]
-                json_digests.append((version, pullspec, digest))
-                # if this payload is a manifest list, iterate through each manifest
-                manifests = release_info.get("manifests", [])
-                for manifest in manifests:
-                    if manifest["platform"]["os"] != "linux":
-                        raise ValueError("Unsupported OS %s in manifest list %s", manifest["platform"]["os"], release_info["image"])
-                    json_digests.append((version, pullspec, manifest["digest"]))
-
-            for version, pullspec, digest in json_digests:
-                sig_file = json_digest_sig_dir / f"{digest.replace(':', '=')}" / "signature-1"
-                tasks.append(self._sign_json_digest(signatory, version, pullspec, digest, sig_file))
-
-            for message_digest in message_digests:
-                input_path = base_to_mirror_dir / message_digest
-                if not input_path.is_file():
-                    raise IOError(f"Message digest file {input_path} doesn't exist or is not a regular file")
-                sig_file = message_digest_sig_dir / f"{message_digest}.gpg"
-                tasks.append(self._sign_message_digest(signatory, release_name, input_path, sig_file))
-            await asyncio.gather(*tasks)
-
-        self._logger.info("All artifacts have been successfully signed.")
-        self._logger.info("Publishing signatures...")
-        tasks = []
-        if json_digests:
-            tasks.append(self._publish_json_digest_signatures(json_digest_sig_dir))
-        if message_digests:
-            tasks.append(self._publish_message_digest_signatures(message_digest_sig_dir))
-        await asyncio.gather(*tasks)
-        self._logger.info("All signatures have been published.")
-
-    async def _sign_json_digest(self, signatory: AsyncSignatory, release_name: str, pullspec: str, digest: str, sig_path: Path):
-        """ Sign a JSON digest claim
-        :param signatory: Signatory
-        :param pullspec: Pullspec of the payload
-        :param digest: SHA256 digest of the payload
-        :param sig_path: Where to save the signature file
-        """
-        self._logger.info("Signing json digest for payload %s with digest %s...", pullspec, digest)
-        if self.runtime.dry_run:
-            self._logger.warning("[DRY RUN] Would have signed the requested artifact.")
-            return
-        sig_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(sig_path, "wb") as sig_file:
-            await signatory.sign_json_digest(
-                product="openshift",
-                release_name=release_name,
-                pullspec=pullspec,
-                digest=digest,
-                sig_file=sig_file)
-
-
-
-    async def promote(self, assembly_type: assembly.AssemblyTypes, release_name: str, arches: List[str], previous_list: List[str], metadata: Optional[Dict], reference_releases: Dict[str, str], tag_stable: bool):
-        """ Promote all release payloads
-        :param assembly_type: Assembly type
-        :param release_name: Release name. e.g. 4.11.0-rc.6
-        :param arches: List of architecture names. e.g. ["x86_64", "s390x"]. Don't use "multi" in this parameter.
-        :param previous_list: Previous list.
-        :param metadata: Payload metadata
-        :param reference_releases: A dict of reference release payloads to promote. Keys are architecture names, values are payload pullspecs
-        :param tag_stable: Whether to tag the promoted payload to "4-stable[-$arch]" release stream.
-        :return: A dict. Keys are architecture name or "multi", values are release_info dicts.
-        """
-        tasks = OrderedDict()
-        if not self.no_multi and self._multi_enabled:
-            tasks["heterogeneous"] = self._promote_heterogeneous_payload(assembly_type, release_name, arches, previous_list, metadata, tag_stable)
-        else:
-            self._logger.warning("Multi/heterogeneous payload is disabled.")
-        if not self.multi_only:
-            tasks["homogeneous"] = self._promote_homogeneous_payloads(assembly_type, release_name, arches, previous_list, metadata, reference_releases, tag_stable)
-        else:
-            self._logger.warning("Arch-specific homogeneous release payloads will not be promoted because --multi-only is set.")
-        try:
-            results = dict(zip(tasks.keys(), await asyncio.gather(*tasks.values())))
-        except ChildProcessError as err:
-            self._logger.error("Error promoting release images: %s\n%s", str(err), traceback.format_exc())
-            raise
-        return_value = {}
-        if "homogeneous" in results:
-            return_value.update(results["homogeneous"])
-        if "heterogeneous" in results:
-            return_value["multi"] = results["heterogeneous"]
-        return return_value
-
-    async def _promote_homogeneous_payloads(self, assembly_type: assembly.AssemblyTypes, release_name: str, arches: List[str], previous_list: List[str], metadata: Optional[Dict], reference_releases: Dict[str, str], tag_stable: bool):
-        """ Promote homogeneous payloads for specified architectures
-        :param assembly_type: Assembly type
-        :param release_name: Release name. e.g. 4.11.0-rc.6
-        :param arches: List of architecture names. e.g. ["x86_64", "s390x"].
-        :param previous_list: Previous list.
-        :param metadata: Payload metadata
-        :param reference_releases: A dict of reference release payloads to promote. Keys are architecture names, values are payload pullspecs
-        :param tag_stable: Whether to tag the promoted payload to "4-stable[-$arch]" release stream.
-        :return: A dict. Keys are architecture name, values are release_info dicts.
-        """
-        tasks = []
-        for arch in arches:
-            tasks.append(self._promote_arch(assembly_type, release_name, arch, previous_list, metadata, reference_releases.get(arch), tag_stable))
-        release_infos = await asyncio.gather(*tasks)
-        return dict(zip(arches, release_infos))
-
+        # sign these serially for now... minimize confusion if something goes wrong
+        if not all([await self.sign_pullspec(ps, release_name) for ps in self.pullspecs]):
+            raise RuntimeError("Not all succeeded, check errors above.")
 
     @staticmethod
-    async def get_image_info(pullspec: str, raise_if_not_found: bool = False):
-        # Get image manifest/manifest-list.
-        cmd = f'oc image info --show-multiarch -o json {pullspec}'
-        env = os.environ.copy()
-        rc, stdout, stderr = await exectools.cmd_gather_async(cmd, check=False, env=env)
-        if rc != 0:
-            if "not found: manifest unknown" in stderr or "was deleted or has expired" in stderr:
-                # image doesn't exist
-                if raise_if_not_found:
-                    raise IOError(f"Image {pullspec} is not found.")
-                return None
-            raise ChildProcessError(f"Error running {cmd}: exit_code={rc}, stdout={stdout}, stderr={stderr}")
+    def _digestify_pullspec(pullspec, digest):
+        """ given an existing pullspec, give the pullspec for a digest in the same repo """
+        if len(halves := pullspec.split("@sha256:")) == 2:  # assume that was a digest at the end
+            return f"{halves[0]}@{digest}"
+        elif len(halves := pullspec.rsplit(":", 1)) == 2:
+            # assume that was a tag at the end, while allowing for ":" in the registry spec
+            return f"{halves[0]}@{digest}"
+        return f"{pullspec}@{digest}"  # assume it was a bare registry/repo
 
-        # Info provided by oc need to be converted back into Skopeo-looking format
-        info = json.loads(stdout)
-        if not isinstance(info, list):
-            raise ValueError(f"Invalid image info: {info}")
-
-        media_types = set([manifest['mediaType'] for manifest in info])
-        if len(media_types) > 1:
-            raise ValueError(f'Inconsistent media types across manifests: {media_types}')
-
-        manifests = {
-            'mediaType': "application/vnd.docker.distribution.manifest.list.v2+json",
-            'manifests': [
-                {
-                    'digest': manifest['digest'],
-                    'platform': {
-                        'architecture': manifest['config']['architecture'],
-                        'os': manifest['config']['os']
-                    }
-                } for manifest in info
+    async def sign_pullspec(self, pullspec: str, release_name: Optional[str] = None) -> bool:
+        """
+        determine what a pullspec is (single manifest, manifest list, release image) and
+        recursively sign it or its references.
+        :param pullspec: Pullspec to be signed
+        :param release_name: Require any release images to have this release name
+        """
+        self._logger.info("Preparing to sign %s", pullspec)
+        img_info = await get_image_info(pullspec, True)
+        tasks = []
+        if isinstance(img_info, list):  # pullspec is for a manifest list
+            tasks = [
+                self.sign_pullspec(
+                    self._digestify_pullspec(manifest["name"], manifest["digest"]),
+                    release_name)
+                for manifest in img_info
             ]
-        }
+        elif (this_rn := img_info["config"]["config"]["Labels"].get("io.openshift.release")):
+            # get references and sign those
+            if release_name and release_name != this_rn:
+                self._logger.error(
+                    "release image at %s has release name %s, not the expected %s",
+                    pullspec, this_rn, release_name)
+                return False
+            tasks = [
+                self.sign_pullspec(ps)
+                for ps in await self.get_release_image_references(pullspec)
+            ]
+            # also sign the release image
+            tasks.append(self._sign_single_manifest(pullspec))
+        else:  # pullspec is for a normal image manifest
+            tasks.append(self._sign_single_manifest(pullspec))
 
-        return manifests
+        return all(await asyncio.gather(*tasks))  # true if all succeed
+
+    async def _sign_single_manifest(self, pullspec: str) -> bool:
+        """ use sigstore to sign a single image manifest and upload the signature
+        :param pullspec: Pullspec to be signed
+        """
+        log = self._logger
+        cmd = ["cosign", "sign", "--key", f"awskms:///{self.signing_key_id}", pullspec]
+        env=os.environ | {"AWS_CONFIG_FILE": self.signing_creds}
+        if self.runtime.dry_run:
+            log.debug("[DRY RUN] Would have signed image: %s", cmd)
+            return True
+
+        log.debug("Signing %s...", pullspec)
+        rc, stdout, stderr = await exectools.cmd_gather_async(cmd, check=False, env=os.environ.copy())
+        if rc:
+            log.error("Failure signing %s:\n%s", pullspec, stderr)
+            return False
+
+        log.debug("Successfully signed %s:\n%s", pullspec, stdout)
+        return True
 
     @staticmethod
-    async def get_multi_image_digest(pullspec: str, raise_if_not_found: bool = False):
-        # Get image digest
-        cmd = f'oc image info {pullspec} --filter-by-os linux/amd64 -o json'
-        env = os.environ.copy()
-        rc, stdout, stderr = await exectools.cmd_gather_async(cmd, check=False, env=env)
-
-        if rc != 0:
-            if "manifest unknown" in stderr or "was deleted or has expired" in stderr:
-                # image doesn't exist
-                if raise_if_not_found:
-                    raise IOError(f"Image {pullspec} is not found.")
-                return None
-            raise ChildProcessError(f"Error running {cmd}: exit_code={rc}, stdout={stdout}, stderr={stderr}")
-
-        return json.loads(stdout)['listDigest']
-
-    @staticmethod
-    async def get_image_stream_tag(namespace: str, image_stream_tag: str):
-        cmd = [
-            "oc",
-            "-n",
-            namespace,
-            "get",
-            "imagestreamtag",
-            "-o",
-            "json",
-            "--ignore-not-found",
-            "--",
-            image_stream_tag,
-        ]
-        env = os.environ.copy()
-        env["GOTRACEBACK"] = "all"
-        _, stdout, _ = await exectools.cmd_gather_async(cmd, env=env, stderr=None)
-        stdout = stdout.strip()
-        if not stdout:  # Not found
-            return None
-        return json.loads(stdout)
+    async def get_release_image_references(pullspec: str) -> List[str]:
+        # Retrieve pullspecs that the release image references
+        return list(
+            tag["from"]["name"]
+            for tag in (await get_release_image_info(pullspec))["references"]["spec"]["tags"]
+        )
 
 
 @cli.command("cosign-container")
 @click.option("-g", "--group", metavar='NAME', required=True,
               help="The group of components on which to operate. e.g. openshift-4.15")
-@click.option("--assembly", metavar="ASSEMBLY_NAME", required=True,
+@click.option("-a", "--assembly", metavar="ASSEMBLY_NAME", required=True,
               help="The name of an assembly to be signed. e.g. 4.15.1")
-@click.option("--multi", type=click.Choice(("yes", "no", "only")), help="Whether to sign multi-arch or arch-specific payloads.")
-@click.option("--signing-key", type=click.Choice(("prod", "stage")),
+@click.option("--multi", type=click.Choice(("yes", "no", "only")), default="yes",
+              help="Whether to sign multi-arch or arch-specific payloads.")
+@click.option("--signing-key", type=click.Choice(("prod", "stage")), default="stage",
               help="Key to use for signing: prod or stage")
 @click.argument('pullspecs', nargs=-1, required=False)
 @pass_runtime
 @click_coroutine
-async def cosign_container(runtime: Runtime, group: str, assembly: str,
-                  multi: Optional[str]="yes",
-                  signing_key: Optional[str]="prod",
-                  pullspecs: Optional[List[str]]=None):
-    pipeline = await CosignPipeline.create(
+async def cosign_container(
+        runtime: Runtime, group: str, assembly: str,
+        multi: str, signing_key: str,
+        pullspecs: Optional[List[str]]=None):
+    pipeline = await SigstorePipeline.create(
         runtime, group, assembly,
         multi, signing_key, pullspecs
     )
