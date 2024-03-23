@@ -25,23 +25,17 @@ class SigstorePipeline:
         return self
 
     def __init__(self, runtime: Runtime, group: str, assembly: str,
-                 multi: str, signing_key: str,
-                 pullspecs: Optional[List[str]]
+                 multi: str, pullspecs: Optional[List[str]]
                 ) -> None:
         self.runtime = runtime
         self.group = group
         self.assembly = assembly
         self.sign_multi = multi != "no"
         self.sign_arches = multi != "only"
-        self.signing_key = signing_key
         self.pullspecs = pullspecs
 
-        if signing_key == "prod":
-            self.signing_creds = os.environ.get("KMS_CRED_FILE", "dummy-file")
-            self.signing_key_id = os.environ.get("KMS_KEY_ID", "dummy-key")
-        else:
-            self.signing_creds = os.environ.get("TEST_KMS_CRED_FILE", "dummy-file")
-            self.signing_key_id = os.environ.get("TEST_KMS_KEY_ID", "dummy-key")
+        self.signing_creds = os.environ.get("KMS_CRED_FILE", "dummy-file")
+        self.signing_key_id = os.environ.get("KMS_KEY_ID", "dummy-key")
 
         self._logger = self.runtime.logger
 
@@ -53,11 +47,7 @@ class SigstorePipeline:
     def check_environment_variables(self):
         logger = self.runtime.logger
 
-        required_vars = ["QUAY_USERNAME", "QUAY_PASSWORD"]
-        if self.signing_key == "prod":
-            required_vars += ["KMS_CRED_FILE", "KMS_KEY_ID"]
-        else:
-            required_vars += ["TEST_KMS_CRED_FILE", "TEST_KMS_KEY_ID"]
+        required_vars = ["QUAY_USERNAME", "QUAY_PASSWORD", "KMS_CRED_FILE", "KMS_KEY_ID"]
 
         for env_var in required_vars:
             if not os.environ.get(env_var):  # not there, or empty
@@ -100,7 +90,9 @@ class SigstorePipeline:
 
         if not self.pullspecs:
             # look up release images we expect to be there since none given
-            arches = releases_config.get("group", {}).get("arches") or group_config.get("arches") or []
+            arches = []
+            if self.sign_arches:
+                arches += releases_config.get("group", {}).get("arches") or group_config.get("arches") or []
             if self.sign_multi:
                 arches.append("multi")
             self.pullspecs = list(f"{constants.RELEASE_IMAGE_REPO}:{release_name}-{arch}" for arch in arches)
@@ -190,17 +182,14 @@ class SigstorePipeline:
               help="The name of an assembly to be signed. e.g. 4.15.1")
 @click.option("--multi", type=click.Choice(("yes", "no", "only")), default="yes",
               help="Whether to sign multi-arch or arch-specific payloads.")
-@click.option("--signing-key", type=click.Choice(("prod", "stage")), default="stage",
-              help="Key to use for signing: prod or stage")
 @click.argument('pullspecs', nargs=-1, required=False)
 @pass_runtime
 @click_coroutine
 async def cosign_container(
         runtime: Runtime, group: str, assembly: str,
-        multi: str, signing_key: str,
-        pullspecs: Optional[List[str]]=None):
+        multi: str, pullspecs: Optional[List[str]]=None):
     pipeline = await SigstorePipeline.create(
         runtime, group, assembly,
-        multi, signing_key, pullspecs
+        multi, pullspecs
     )
     await pipeline.run()
