@@ -3,7 +3,7 @@ import json
 import os
 import sys
 import click
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Union, Set
 from semver import VersionInfo
 
 from pyartcd.signatory import AsyncSignatory
@@ -89,7 +89,10 @@ class SigstorePipeline:
         logger.info("Release name: %s", release_name)
 
         if not self.pullspecs:
-            # look up release images we expect to be there since none given
+            # look up release images we expect to be there since none given.
+            # NOTE: only do this for testing purposes. for secure signing, always supply an
+            # immutable pullspec with a digest (as tags could theoretically be rewritten in between
+            # publishing and signing). TODO: enforce this at invocation time
             arches = []
             if self.sign_arches:
                 arches += releases_config.get("group", {}).get("arches") or group_config.get("arches") or []
@@ -97,9 +100,22 @@ class SigstorePipeline:
                 arches.append("multi")
             self.pullspecs = list(f"{constants.RELEASE_IMAGE_REPO}:{release_name}-{arch}" for arch in arches)
 
-        # sign these serially for now... minimize confusion if something goes wrong
-        if not all([await self.sign_pullspec(ps, release_name) for ps in self.pullspecs]):
-            raise RuntimeError("Not all succeeded, check errors above.")
+        # given pullspecs that are most likely trees (either manifest lists or release images),
+        # recursively discover all the pullspecs that need to be signed.
+        need_signing: Set[str] = set()
+        errors: Dict[str, str] = {}  # pullspec -> exception
+        need_signing, errors = await self.discover_pullspecs(self.pullspecs, release_name)
+
+        if errors:
+            print("Not all pullspecs examined were viable:")
+            for ps, err in errors.items():
+                print(f"{ps}: {err}")
+            exit(1)
+
+        errors = await self.sign_pullspecs(need_signing):
+        if errors:
+            print(f"Not all signings succeeded, check errors: {errors}")
+            exit(1)
 
     @staticmethod
     def _digestify_pullspec(pullspec, digest):
@@ -111,40 +127,63 @@ class SigstorePipeline:
             return f"{halves[0]}@{digest}"
         return f"{pullspec}@{digest}"  # assume it was a bare registry/repo
 
-    async def sign_pullspec(self, pullspec: str, release_name: Optional[str] = None) -> bool:
+    #async def sign_pullspec(self, pullspec: str, release_name: Optional[str] = None) -> bool:
+    async def discover_pullspecs(self, pullspecs: Iterable[str], release_name: str) ->
+                                (Set[str], Dict[str, Exception]):
+        """
+        recursively discover pullspecs that need signatures.
+        :param pullspecs: List of pullspecs to descend from
+        :param release_name: Require any release images to have this release name
+        """
+        seen: Set[str] = set(pullspecs)  # prevent re-examination
+        need_signing: Set[str] = set()
+        errors: Dict[str, Exception] = {}
+
+        need_examining: List[str] = list(pullspecs)
+        while need_examining:
+            tasks = [self._examine_pullspec(ps, release_name, seen) for ps in need_examining]
+
+    async def _examine_pullspec(self, pullspec, release_name: str, seen: Set[str]) ->
+                               (Set[str], Set[str], Dict[str, Exception]):
+
         """
         determine what a pullspec is (single manifest, manifest list, release image) and
-        recursively sign it or its references.
+        recursively add it or its references. limit concurrency or we can run out of processes.
         :param pullspec: Pullspec to be signed
         :param release_name: Require any release images to have this release name
         """
-        self._logger.info("Preparing to sign %s", pullspec)
-        img_info = await get_image_info(pullspec, True)
-        tasks = []
-        if isinstance(img_info, list):  # pullspec is for a manifest list
-            tasks = [
-                self.sign_pullspec(
-                    self._digestify_pullspec(manifest["name"], manifest["digest"]),
-                    release_name)
-                for manifest in img_info
-            ]
-        elif (this_rn := img_info["config"]["config"]["Labels"].get("io.openshift.release")):
-            # get references and sign those
-            if release_name and release_name != this_rn:
-                self._logger.error(
-                    "release image at %s has release name %s, not the expected %s",
-                    pullspec, this_rn, release_name)
-                return False
-            tasks = [
-                self.sign_pullspec(ps)
-                for ps in await self.get_release_image_references(pullspec)
-            ]
-            # also sign the release image
-            tasks.append(self._sign_single_manifest(pullspec))
-        else:  # pullspec is for a normal image manifest
-            tasks.append(self._sign_single_manifest(pullspec))
+        need_signing: Set[str] = set()
+        need_examining: Set[str] = set()
+        errors: Dict[str, Exception] = {}
 
-        return all(await asyncio.gather(*tasks))  # true if all succeed
+        self._logger.info("Examining %s", pullspec)
+        img_info = await get_image_info(pullspec, True)
+
+        if isinstance(img_info, list):  # pullspec is for a manifest list
+            for manifest in img_info
+                child_spec = self._digestify_pullspec(manifest["name"], manifest["digest"]))
+                if child_spec not in seen:
+                    seen.add(child_spec)
+                    need_examining.add(child_spec)
+        elif (this_rn := img_info["config"]["config"]["Labels"].get("io.openshift.release")):
+            # release image; get references and examine those
+            if release_name != this_rn:
+                errors[pullspec] = RuntimeError(
+                    f"release image at {pullspec} has release name {this_rn}, not the expected {release_name}"
+                )
+            try:
+                for child_spec in await self.get_release_image_references(pullspec):
+                    if child_spec not in seen:
+                        seen.add(child_spec)
+                        need_examining.add(child_spec)
+            except RuntimeError exc:
+                errors[pullspec] = exc
+            # also plan to sign the release image itself
+            need_signing.add(pullspec)
+        else:  # pullspec is for a normal image manifest
+            need_signing.add(pullspec)
+
+        return need_signing, need_examining, errors
 
     async def _sign_single_manifest(self, pullspec: str) -> bool:
         """ use sigstore to sign a single image manifest and upload the signature
