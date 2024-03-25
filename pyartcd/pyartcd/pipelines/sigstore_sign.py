@@ -222,10 +222,14 @@ class SigstorePipeline:
             return {}
 
         log.info("Signing %s...", pullspec)
-        rc, stdout, stderr = await exectools.cmd_gather_async(cmd, check=False, env=os.environ.copy())
-        if rc:
-            log.error("Failure signing %s:\n%s", pullspec, stderr)
-            return {pullspec: RuntimeError(stderr)}
+        try:
+            rc, stdout, stderr = await exectools.cmd_gather_async(cmd, check=False, env=os.environ.copy())
+            if rc:
+                log.error("Failure signing %s:\n%s", pullspec, stderr)
+                return {pullspec: RuntimeError(stderr)}
+        except Exception as exc:
+            log.error("Failure signing %s:\n%s", pullspec, exc)
+            return {pullspec: exc}
 
         log.debug("Successfully signed %s:\n%s", pullspec, stdout)
         return {}
