@@ -215,7 +215,7 @@ class SigstorePipeline:
         :return: dict with any signing errors for pullspec
         """
         log = self._logger
-        cmd = ["cosign", "sign", "--key", f"awskms:///{self.signing_key_id}", pullspec]
+        cmd = ["cosign", "sign", "--yes", "--key", f"awskms:///{self.signing_key_id}", pullspec]
         env=os.environ | {"AWS_CONFIG_FILE": self.signing_creds}
         if self.runtime.dry_run:
             log.info("[DRY RUN] Would have signed image: %s", cmd)
@@ -253,7 +253,7 @@ class SigstorePipeline:
 @click.argument('pullspecs', nargs=-1, required=False)
 @pass_runtime
 @click_coroutine
-async def cosign_container(
+async def sigstore_sign_container(
         runtime: Runtime, group: str, assembly: str,
         multi: str, pullspecs: Optional[List[str]]=None):
     pipeline = await SigstorePipeline.create(
