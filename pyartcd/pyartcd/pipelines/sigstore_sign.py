@@ -51,7 +51,7 @@ class SigstorePipeline:
     def check_environment_variables(self):
         logger = self.runtime.logger
 
-        required_vars = ["QUAY_USERNAME", "QUAY_PASSWORD", "KMS_CRED_FILE", "KMS_KEY_ID"]
+        required_vars = ["KMS_CRED_FILE", "KMS_KEY_ID"]
 
         for env_var in required_vars:
             if not os.environ.get(env_var):  # not there, or empty
@@ -62,12 +62,14 @@ class SigstorePipeline:
                     raise ValueError(msg)
 
     async def login_quay(self):
-        # the login command has only the variable names in it, so the values can be picked up from
-        # the environment rather than included in the command line where they would be logged.
-        # better would be to have jenkins write a credentials file (and do the same in `promote`).
-        return  # XXX
-        cmd = f'podman login -u "$QUAY_USERNAME" -p "$QUAY_PASSWORD" quay.io'
-        await exectools.cmd_assert_async(['bash', '-c', cmd], env=os.environ.copy(), stdout=sys.stderr)
+        if all(os.environ.get(var) for var in ["QUAY_USERNAME", "QUAY_PASSWORD"]):
+            # the login command has only the variable names in it, so the values can be picked up from
+            # the environment rather than included in the command line where they would be logged.
+            # better would be to have jenkins write a credentials file (and do the same in `promote`).
+            cmd = f'podman login -u "$QUAY_USERNAME" -p "$QUAY_PASSWORD" quay.io'
+            await exectools.cmd_assert_async(['bash', '-c', cmd], env=os.environ.copy(), stdout=sys.stderr)
+        else:
+            self._logger.info("quay login credentials not given in environment; using existing container auth")
 
     async def run(self):
         logger = self.runtime.logger
