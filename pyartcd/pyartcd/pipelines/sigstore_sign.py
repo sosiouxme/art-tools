@@ -216,14 +216,15 @@ class SigstorePipeline:
         """
         log = self._logger
         cmd = ["cosign", "sign", "--yes", "--key", f"awskms:///{self.signing_key_id}", pullspec]
-        env=os.environ | {"AWS_CONFIG_FILE": self.signing_creds}
+        # easier to set AWS_REGION than create AWS_CONFIG_FILE, unless it gets more complicated
+        env = os.environ | dict(AWS_SHARED_CREDENTIALS_FILE=self.signing_creds, AWS_REGION="us-east-1")
         if self.runtime.dry_run:
             log.info("[DRY RUN] Would have signed image: %s", cmd)
             return {}
 
         log.info("Signing %s...", pullspec)
         try:
-            rc, stdout, stderr = await exectools.cmd_gather_async(cmd, check=False, env=os.environ.copy())
+            rc, stdout, stderr = await exectools.cmd_gather_async(cmd, check=False, env=env)
             if rc:
                 log.error("Failure signing %s:\n%s", pullspec, stderr)
                 return {pullspec: RuntimeError(stderr)}
