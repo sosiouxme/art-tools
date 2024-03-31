@@ -3,15 +3,13 @@ import json
 import os
 import sys
 import click
-from typing import Dict, Iterable, List, Optional, Union, Set
+from typing import Dict, List, Optional, Union, Set
 from semver import VersionInfo
 
-from pyartcd.signatory import AsyncSignatory
+from pyartcd.signatory import SigstoreSignatory
 from pyartcd import constants, exectools, util
 from pyartcd.cli import cli, click_coroutine, pass_runtime
-from pyartcd.oc import get_release_image_info, get_image_info
 from pyartcd.runtime import Runtime, GroupRuntime
-from artcommonlib.util import run_limited_unordered
 
 
 CONCURRENCY_LIMIT = 100  # we run out of processes without a limit
@@ -22,9 +20,14 @@ class SigstorePipeline:
     @classmethod
     async def create(cls, *args, **kwargs):
         self = cls(*args, **kwargs)
+        doozer_data_path = os.environ.get("DOOZER_DATA_PATH") or constants.OCP_BUILD_DATA_URL
         self.group_runtime = await GroupRuntime.create(
             self.runtime.config, self.runtime.working_dir,
-            self.group, self.assembly
+            self.group, self.assembly, doozer_data_path
+        )
+        self.releases_config = await util.load_releases_config(
+            group=self.group,
+            data_path=doozer_data_path,
         )
         return self
 
@@ -37,27 +40,25 @@ class SigstorePipeline:
         self.sign_multi = multi != "no"
         self.sign_arches = multi != "only"
         self.pullspecs = pullspecs
-
-        self.signing_creds = os.environ.get("KMS_CRED_FILE", "dummy-file")
-        self.signing_key_id = os.environ.get("KMS_KEY_ID", "dummy-key")
-
         self._logger = self.runtime.logger
 
-        self._working_dir = self.runtime.working_dir
-        self._doozer_working_dir = self._working_dir / "doozer-working"
-        self._doozer_env_vars = os.environ.copy()
-        self._doozer_env_vars["DOOZER_WORKING_DIR"] = str(self._doozer_working_dir)
+        self.signatory = SigstoreSignatory(
+            logger=self._logger,
+            dry_run=self.runtime.dry_run,
+            signing_creds=os.environ.get("KMS_CRED_FILE", "dummy-file"),
+            signing_key_id=os.environ.get("KMS_KEY_ID", "dummy-key"),
+            concurrency_limit=CONCURRENCY_LIMIT,
+        )
+
 
     def check_environment_variables(self):
-        logger = self.runtime.logger
-
         required_vars = ["KMS_CRED_FILE", "KMS_KEY_ID"]
 
         for env_var in required_vars:
             if not os.environ.get(env_var):  # not there, or empty
                 msg = f"Environment variable {env_var} is not set."
                 if self.runtime.dry_run:
-                    logger.warning(msg)
+                    self._logger.warning(msg)
                 else:
                     raise ValueError(msg)
 
@@ -78,17 +79,12 @@ class SigstorePipeline:
 
         # Load group config and releases.yml
         logger.info("Loading build metadata...")
-        group_config = self.group_runtime.group_config
-        releases_config = await util.load_releases_config(
-            group=self.group,
-            data_path=self._doozer_env_vars.get("DOOZER_DATA_PATH") or constants.OCP_BUILD_DATA_URL
-        )
-        if releases_config.get("releases", {}).get(self.assembly) is None:
+        if self.releases_config.get("releases", {}).get(self.assembly) is None:
             raise ValueError(f"To sign this release, assembly {self.assembly} must be explicitly defined in releases.yml.")
 
         # Get release name
-        assembly_type = util.get_assembly_type(releases_config, self.assembly)
-        release_name = util.get_release_name_for_assembly(self.group, releases_config, self.assembly)
+        assembly_type = util.get_assembly_type(self.releases_config, self.assembly)
+        release_name = util.get_release_name_for_assembly(self.group, self.releases_config, self.assembly)
         # Ensure release name is valid
         if not VersionInfo.is_valid(release_name):
             raise ValueError(f"Release name `{release_name}` is not a valid semver.")
@@ -102,7 +98,7 @@ class SigstorePipeline:
         # recursively discover all the pullspecs that need to be signed.
         need_signing: Set[str] = set()
         errors: Dict[str, str] = {}  # pullspec -> exception
-        need_signing, errors = await self.discover_pullspecs(self.pullspecs, release_name)
+        need_signing, errors = await self.signatory.discover_pullspecs(self.pullspecs, release_name)
 
         if errors:
             print("Not all pullspecs examined were viable:")
@@ -110,7 +106,7 @@ class SigstorePipeline:
                 print(f"{ps}: {err}")
             exit(1)
 
-        if errors:= await self.sign_pullspecs(need_signing):
+        if errors:= await self.signatory.sign_pullspecs(need_signing):
             print(f"Not all signings succeeded, check errors: {errors}")
             exit(1)
 
@@ -120,130 +116,14 @@ class SigstorePipeline:
         # publishing and signing). TODO: enforce this at invocation time
         arches = []
         if self.sign_arches:
-            arches += releases_config.get("group", {}).get("arches") or group_config.get("arches") or []
+            arches += (
+                self.releases_config.get("group", {}).get("arches")
+                or self.group_runtime.group_config.get("arches")
+                or []
+            )
         if self.sign_multi:
             arches.append("multi")
         return list(f"{constants.RELEASE_IMAGE_REPO}:{release_name}-{arch}" for arch in arches)
-
-    @staticmethod
-    def _digestify_pullspec(pullspec, digest):
-        """ given an existing pullspec, give the pullspec for a digest in the same repo """
-        if len(halves := pullspec.split("@sha256:")) == 2:  # assume that was a digest at the end
-            return f"{halves[0]}@{digest}"
-        elif len(halves := pullspec.rsplit(":", 1)) == 2:
-            # assume that was a tag at the end, while allowing for ":" in the registry spec
-            return f"{halves[0]}@{digest}"
-        return f"{pullspec}@{digest}"  # assume it was a bare registry/repo
-
-    async def discover_pullspecs(
-                self, pullspecs: Iterable[str], release_name: str
-            ) -> (Set[str], Dict[str, Exception]):
-        """
-        recursively discover pullspecs that need signatures.
-        :param pullspecs: List of pullspecs to descend from
-        :param release_name: Require any release images to have this release name
-        :return: a set of pullspecs needing signing, and a dict of any discovery errors
-        """
-        seen: Set[str] = set(pullspecs)  # prevent re-examination and multiple signings
-        need_signing: Set[str] = set()   # pullspecs for manifests to be signed
-        errors: Dict[str, Exception] = {}  # pullspec -> error when examining it
-
-        need_examining: List[str] = list(pullspecs)
-        while need_examining:
-            args = [(ps, release_name) for ps in need_examining]
-            results = await run_limited_unordered(self._examine_pullspec, args, CONCURRENCY_LIMIT)
-
-            need_examining = []
-            for next_signing, next_examining, next_errors in results:
-                need_signing.update(next_signing)
-                errors.update(next_errors)
-                for ps in next_examining:
-                    if ps not in seen:
-                        seen.add(ps)
-                        need_examining.append(ps)
-
-        return need_signing, errors
-
-    async def _examine_pullspec(
-            self, pullspec:str , release_name: str
-            ) -> (Set[str], Set[str], Dict[str, Exception]):
-        """
-        determine what a pullspec is (single manifest, manifest list, release image) and
-        recursively add it or its references. limit concurrency or we can run out of processes.
-        :param pullspec: Pullspec to be signed
-        :param release_name: Require any release images to have this release name
-        :return: pullspecs needing signing, pullspecs needing examining, and any discovery errors
-        """
-        need_signing: Set[str] = set()
-        need_examining: Set[str] = set()
-        errors: Dict[str, Exception] = {}
-
-        img_info = await get_image_info(pullspec, True)
-
-        if isinstance(img_info, list):  # pullspec is for a manifest list
-            for manifest in img_info:
-                need_examining.add(self._digestify_pullspec(manifest["name"], manifest["digest"]))
-        elif (this_rn := img_info["config"]["config"]["Labels"].get("io.openshift.release")):
-            # release image; get references and examine those
-            if release_name != this_rn:
-                errors[pullspec] = RuntimeError(
-                    f"release image at {pullspec} has release name {this_rn}, not the expected {release_name}"
-                )
-            try:
-                for child_spec in await self.get_release_image_references(pullspec):
-                    need_examining.add(child_spec)
-            except RuntimeError as exc:
-                errors[pullspec] = exc
-            # also plan to sign the release image itself
-            need_signing.add(pullspec)
-        else:  # pullspec is for a normal image manifest
-            need_signing.add(pullspec)
-
-        return need_signing, need_examining, errors
-
-    async def sign_pullspecs(self, need_signing: Iterable[str]) -> Dict[str, Exception]:
-        """
-        sign the given pullspecs.
-        :param need_signing: Pullspecs to be signed
-        :return: dict with any signing errors per pullspec
-        """
-        args = [(ps, ) for ps in need_signing]
-        results = await run_limited_unordered(self._sign_single_manifest, args, CONCURRENCY_LIMIT)
-        return {pullspec: err for result in results for pullspec, err in result.items()}
-
-    async def _sign_single_manifest(self, pullspec: str) -> Dict[str, Exception]:
-        """ use sigstore to sign a single image manifest and upload the signature
-        :param pullspec: Pullspec to be signed
-        :return: dict with any signing errors for pullspec
-        """
-        log = self._logger
-        cmd = ["cosign", "sign", "--yes", "--key", f"awskms:///{self.signing_key_id}", pullspec]
-        # easier to set AWS_REGION than create AWS_CONFIG_FILE, unless it gets more complicated
-        env = os.environ | dict(AWS_SHARED_CREDENTIALS_FILE=self.signing_creds, AWS_REGION="us-east-1")
-        if self.runtime.dry_run:
-            log.info("[DRY RUN] Would have signed image: %s", cmd)
-            return {}
-
-        log.info("Signing %s...", pullspec)
-        try:
-            rc, stdout, stderr = await exectools.cmd_gather_async(cmd, check=False, env=env)
-            if rc:
-                log.error("Failure signing %s:\n%s", pullspec, stderr)
-                return {pullspec: RuntimeError(stderr)}
-        except Exception as exc:
-            log.error("Failure signing %s:\n%s", pullspec, exc)
-            return {pullspec: exc}
-
-        log.debug("Successfully signed %s:\n%s", pullspec, stdout)
-        return {}
-
-    @staticmethod
-    async def get_release_image_references(pullspec: str) -> List[str]:
-        # Retrieve pullspecs that the release image references
-        return list(
-            tag["from"]["name"]
-            for tag in (await get_release_image_info(pullspec))["references"]["spec"]["tags"]
-        )
 
 
 @cli.command("sigstore-sign")
