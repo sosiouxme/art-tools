@@ -25,6 +25,8 @@ RUN dnf install -y \
     bash-completion vim tmux procps-ng psmisc wget net-tools iproute socat \
     # install rcm-tools
     koji brewkoji rhpkg \
+    # add sigstore cosign tool
+    https://download.eng.bos.redhat.com/brewroot/vol/rhel-8/packages/cosign/2.2.2/3/x86_64/cosign-2.2.2-3.x86_64.rpm \
  && dnf clean all \
  && ln -sfn /usr/bin/python3 /usr/bin/python   # make "python" available
 
