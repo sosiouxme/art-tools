@@ -294,10 +294,12 @@ class SigstoreSignatory:
         img_info = await get_image_info(pullspec, True)
 
         if isinstance(img_info, list):  # pullspec is for a manifest list
+            self._logger.info("%s is a manifest list", pullspec)
             for manifest in img_info:
                 need_examining.add(self._digestify_pullspec(manifest["name"], manifest["digest"]))
         elif (this_rn := img_info["config"]["config"]["Labels"].get("io.openshift.release")):
             # release image; get references and examine those
+            self._logger.info("%s is a release image with name %s", pullspec, this_rn)
             if release_name != this_rn:
                 errors[pullspec] = RuntimeError(
                     f"release image at {pullspec} has release name {this_rn}, not the expected {release_name}"
@@ -316,6 +318,7 @@ class SigstoreSignatory:
                 # also plan to sign the release image itself
                 need_signing.add(pullspec)
         else:  # pullspec is for a normal image manifest
+            self._logger.info("%s is a single manifest", pullspec)
             need_signing.add(pullspec)
 
         return need_signing, need_examining, errors
