@@ -359,7 +359,7 @@ class SigstoreSignatory:
         :return: dict with any signing errors for pullspec
         """
         log = self._logger
-        cmd = ["cosign", "sign", "--yes", "--key", f"awskms:///{self.signing_key_id}", pullspec]
+        cmd = ["cosign", "sign", "--tlog-upload=false", "--key", f"awskms:///{self.signing_key_id}", pullspec]
         # easier to set AWS_REGION than create AWS_CONFIG_FILE, unless config gets more complicated
         env = os.environ | dict(AWS_SHARED_CREDENTIALS_FILE=self.signing_creds, AWS_REGION="us-east-1")
         if self.dry_run:
